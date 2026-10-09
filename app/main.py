@@ -17,25 +17,89 @@ Only make it secure. See the lab handout for the task list and rubric.
 
 import sqlite3
 import traceback
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+import os
+import hmac
+import hashlib
+import time
+import secrets
 
 # --- app + config ----------------------------------------------------------
 app = FastAPI(title="SecureNotes API", version="1.0")
 
-# A secret used to sign things. Keep it safe.
-SECRET_KEY = "supersecret123"
+SECRET_KEY = os.environ["SECRET_KEY"].encode()
+ITERATIONS = 600_000
+TOKEN_TTL = 30 * 60
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://127.0.0.1:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# --- request models --------------------------------------------------------
+class Credentials(BaseModel):
+    username: str
+    password: str
+
+class NewNote(BaseModel):
+    title: str
+    body: str
+
+# --- token --------------------------------------------------------
+def _sign(msg: str) -> str:
+    return hmac.new(SECRET_KEY, msg.encode(), hashlib.sha256).hexdigest()
+
+def make_token(user_id: int) -> str:
+    msg = f"{user_id}.{int(time.time()) + TOKEN_TTL}"
+    return f"{msg}.{_sign(msg)}"
+
+def parse_token(token: str) -> int | None:
+    try:
+        user_id, exp, sig = token.split(".")
+        if not hmac.compare_digest(_sign(f"{user_id}.{exp}"), sig):
+            return None  # forged or tampered
+        if int(exp) < time.time():
+            return None  # expired
+        return int(user_id)
+    except ValueError:
+        return None
+
+# --- auth helper -----------------------------------------------------------
+def current_user(authorization: str = Header(default="")):
+    token = authorization.removeprefix("Bearer ")
+    user_id = parse_token(token)
+    row = db.execute("SELECT id, username, is_admin FROM users WHERE id = ?", (user_id,)).fetchone()
+    return row
+
+# --- error handling --------------------------------------------------------
+@app.exception_handler(Exception)
+async def handle_everything():
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error"},
+    )
+
+# --- password --------------------------------------------------------
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)  
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, ITERATIONS)
+    return f"{ITERATIONS}${salt.hex()}${key.hex()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        iterations, salt_hex, key_hex = stored.split("$")
+        key = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations)
+        )
+        return hmac.compare_digest(key, bytes.fromhex(key_hex))
+    except ValueError:
+        return False
 
 # --- database (SQLite, created fresh on startup) ---------------------------
 db = sqlite3.connect(":memory:", check_same_thread=False)
@@ -60,43 +124,23 @@ def init_db():
         """
     )
     # seed: one admin, two normal users, a few notes
-    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('admin','admin123',1)")
-    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('alice','alicepass',0)")
-    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('bob','bobpass',0)")
+    db.execute(
+        "INSERT INTO users (username, password, is_admin) VALUES (?, ?, ?)",
+        ("admin", hash_password("admin123"), 1),
+    )
+    db.execute(
+        "INSERT INTO users (username, password, is_admin) VALUES (?, ?, ?)",
+        ("alice", hash_password("alicepass"), 0),
+    )
+    db.execute(
+        "INSERT INTO users (username, password, is_admin) VALUES (?, ?, ?)",
+        ("bob", hash_password("bobpass"), 0),
+    )
     db.execute("INSERT INTO notes (owner_id, title, body) VALUES (2,'Alice diary','Alice secret note')")
     db.execute("INSERT INTO notes (owner_id, title, body) VALUES (3,'Bob plans','Bob secret note')")
     db.commit()
 
-
 init_db()
-
-
-# --- request models --------------------------------------------------------
-class Credentials(BaseModel):
-    username: str
-    password: str
-
-
-class NewNote(BaseModel):
-    title: str
-    body: str
-
-
-# --- auth helper -----------------------------------------------------------
-def current_user(authorization: str = Header(default=None)):
-    """Read the token from the Authorization header and return the user row."""
-    token = (authorization or "").replace("Bearer ", "")
-    row = db.execute("SELECT * FROM users WHERE id = ?", (token,)).fetchone()
-    return row
-
-
-# --- error handling --------------------------------------------------------
-@app.exception_handler(Exception)
-async def handle_everything(request, exc):
-    return JSONResponse(
-        status_code=500,
-        content={"error": str(exc), "trace": traceback.format_exc()},
-    )
 
 
 # --- routes ----------------------------------------------------------------
@@ -104,7 +148,7 @@ async def handle_everything(request, exc):
 def register(creds: Credentials):
     db.execute(
         "INSERT INTO users (username, password, is_admin) VALUES (?, ?, 0)",
-        (creds.username, creds.password),
+        (creds.username, hash_password(creds.password)),
     )
     db.commit()
     return {"message": f"user {creds.username} created"}
@@ -113,34 +157,29 @@ def register(creds: Credentials):
 @app.post("/login")
 def login(creds: Credentials):
     row = db.execute(
-        f"SELECT id, password FROM users WHERE username = '{creds.username}'"
+        "SELECT id, password FROM users WHERE username = ?", (creds.username,)
     ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="No account with that username")
-    if row["password"] != creds.password:
-        raise HTTPException(status_code=401, detail="Wrong password")
-    return {"token": str(row["id"])}
+    if row is None or not verify_password(creds.password, row["password"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return {"token": make_token(row["id"]), "token_type": "bearer"}
 
 
 @app.get("/notes")
-def list_my_notes(authorization: str = Header(default=None)):
-    user = current_user(authorization)
+def list_my_notes(user=Depends(current_user)):
     rows = db.execute("SELECT * FROM notes WHERE owner_id = ?", (user["id"],)).fetchall()
     return [dict(r) for r in rows]
 
 
 @app.get("/notes/{note_id}")
-def get_note(note_id: int, authorization: str = Header(default=None)):
-    user = current_user(authorization)
-    row = db.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
+def get_note(note_id: int, user=Depends(current_user)):
+    row = db.execute("SELECT * FROM notes WHERE id = ? AND owner_id = ?", (note_id, user["id"])).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Note not found")
     return dict(row)
 
 
 @app.post("/notes")
-def create_note(note: NewNote, authorization: str = Header(default=None)):
-    user = current_user(authorization)
+def create_note(note: NewNote, user=Depends(current_user)):
     cur = db.execute(
         "INSERT INTO notes (owner_id, title, body) VALUES (?, ?, ?)",
         (user["id"], note.title, note.body),
@@ -150,13 +189,9 @@ def create_note(note: NewNote, authorization: str = Header(default=None)):
 
 
 @app.get("/admin/users")
-def list_all_users(authorization: str = Header(default=None)):
-    user = current_user(authorization)
-    try:
-        if not user["is_admin"]:
-            raise HTTPException(status_code=403, detail="Admins only")
-    except Exception:
-        pass  # keep going if the check has a problem
+def list_all_users(user=Depends(current_user)):
+    if not user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Admins only")
     rows = db.execute("SELECT * FROM users").fetchall()
     return [dict(r) for r in rows]
 
