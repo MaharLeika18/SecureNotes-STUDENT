@@ -15,8 +15,6 @@ Do NOT change the behaviour students rely on (register, login, notes still work)
 Only make it secure. See the lab handout for the task list and rubric.
 """
 
-import hashlib
-import os
 import sqlite3
 import traceback
 from fastapi import FastAPI, Header, HTTPException
@@ -28,11 +26,11 @@ from pydantic import BaseModel
 app = FastAPI(title="SecureNotes API", version="1.0")
 
 # A secret used to sign things. Keep it safe.
-SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production")
+SECRET_KEY = "supersecret123"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,9 +60,9 @@ def init_db():
         """
     )
     # seed: one admin, two normal users, a few notes
-    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('admin', ?, 1)", (hashlib.sha256(b'admin123').hexdigest(),))
-    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('alice', ?, 0)", (hashlib.sha256(b'alicepass').hexdigest(),))
-    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('bob', ?, 0)", (hashlib.sha256(b'bobpass').hexdigest(),))
+    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('admin','admin123',1)")
+    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('alice','alicepass',0)")
+    db.execute("INSERT INTO users (username, password, is_admin) VALUES ('bob','bobpass',0)")
     db.execute("INSERT INTO notes (owner_id, title, body) VALUES (2,'Alice diary','Alice secret note')")
     db.execute("INSERT INTO notes (owner_id, title, body) VALUES (3,'Bob plans','Bob secret note')")
     db.commit()
@@ -127,9 +125,7 @@ def list_my_notes(authorization: str = Header(default=None)):
 def get_note(note_id: int, authorization: str = Header(default=None)):
     user = current_user(authorization)
     row = db.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Note not found")
-    if user is None or row["owner_id"] != user["id"]:
+    if user is None or row is None or row["owner_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     return dict(row)
 
